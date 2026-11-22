@@ -63,6 +63,9 @@ All three Termux packages must be installed from **F-Droid** so they share the s
    appops set com.termux.api SYSTEM_ALERT_WINDOW allow
    appops set com.termux SYSTEM_ALERT_WINDOW allow
    appops set com.termux MANAGE_EXTERNAL_STORAGE allow
+   dumpsys deviceidle whitelist +com.termux +com.termux.api +com.termux.widget
+   settings put global settings_enable_monitor_phantom_procs false
+   device_config put activity_manager max_phantom_processes 2147483647
    "
    ```
 
@@ -173,7 +176,22 @@ RAW_AUDIO="${BASE_FILE}.m4a"
 AUDIO_FILE="${BASE_FILE}.wav"
 TRANSCRIPT_FILE="${BASE_FILE}_transcript.txt"
 SUMMARY_FILE="${BASE_FILE}_BA_analysis.md"
+LOG_FILE="${BASE_FILE}.log"
 TMP_DIR=$(mktemp -d)
+
+exec 2>>"$LOG_FILE"
+
+on_error() {
+  local line="$1"
+  echo "[$(date +"%H:%M:%S")] ERROR at line $line" >> "$LOG_FILE"
+  termux-notification-remove "ba_rec" || true
+  termux-notification-remove "ba_proc" || true
+  termux-notification \
+    --id "ba_err" \
+    --title "❌ Σφάλμα Ανάλυσης BA ($CLIENT_NAME)" \
+    --content "Δες το log: $(basename "$LOG_FILE")" || true
+}
+trap 'on_error $LINENO' ERR
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -231,8 +249,8 @@ termux-notification \
   --content "Επεξεργασία τμημάτων με Qwen2.5-1.5B..." \
   --ongoing
 
-# Σπάσιμο του transcript σε κομμάτια των 1200 λέξεων (~1800-2200 tokens, ασφαλές για -c 4096)
-tr -s "[:space:]" "\n" < "$TRANSCRIPT_FILE" | split -l 1200 -d - "$TMP_DIR/words_"
+# Σπάσιμο του transcript σε κομμάτια των 700 λέξεων (ασφαλές για -c 2048 και 3.5GB RAM)
+tr -s "[:space:]" "\n" < "$TRANSCRIPT_FILE" | split -l 700 -d - "$TMP_DIR/words_"
 
 COMBINED_NOTES="$TMP_DIR/combined_notes.txt"
 : > "$COMBINED_NOTES"
@@ -256,12 +274,13 @@ EOP
   "$LLAMA_BIN" \
     -m "$LLAMA_MODEL" \
     -f "$MAP_PROMPT" \
-    -c 4096 \
+    -c 2048 \
     -n 512 \
     -t 6 \
     --temp 0.1 \
+    --repeat-penalty 1.15 \
     --no-display-prompt -no-cnv \
-    -e 2>/dev/null >> "$COMBINED_NOTES"
+    -e >> "$COMBINED_NOTES"
   echo "" >> "$COMBINED_NOTES"
 
   CHUNK_IDX=$((CHUNK_IDX + 1))
@@ -298,12 +317,13 @@ EOP
   "$LLAMA_BIN" \
     -m "$LLAMA_MODEL" \
     -f "$REDUCE_PROMPT" \
-    -c 4096 \
-    -n 1200 \
+    -c 3072 \
+    -n 1024 \
     -t 6 \
     --temp 0.2 \
+    --repeat-penalty 1.15 \
     --no-display-prompt -no-cnv \
-    -e 2>/dev/null
+    -e
 } > "$SUMMARY_FILE"
 
 termux-notification-remove "ba_proc" || true
@@ -379,6 +399,9 @@ fi
 4. **Shortcuts do not appear on the Home Screen:**
    - *Cause:* The `Termux:Widget` app icon was placed instead of the Android Widget, or `allow-external-apps = true` is not enabled.
    - *Fix:* Add the **Widget** (*Long-press Home Screen → Widgets → Termux:Widget*) and ensure `allow-external-apps = true` is set in `~/.termux/termux.properties`.
+5. **Processing stops after Whisper without creating `_BA_analysis.md`:**
+   - *Cause:* Android 13's Phantom Process Killer or LMKD terminates `llama-completion` in the background when running with `-c 4096` on a 3.5 GB RAM device.
+   - *Fix:* Disable Phantom Process Killer (`settings_enable_monitor_phantom_procs=false`), add Termux packages to `deviceidle whitelist`, and use `-c 2048` / 700-word chunks in `ba-engine.sh`.
 
 ---
 
