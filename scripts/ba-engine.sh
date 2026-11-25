@@ -8,6 +8,7 @@ WHISPER_MODEL="$HOME/whisper.cpp/models/ggml-small-q5_1.bin"
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-completion"
 LLAMA_MODEL="$HOME/llama.cpp/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 PID_FILE="$HOME/.ba_recording.pid"
+PROC_LOCK="$HOME/.ba_processing.pid"
 
 RESUME_MODE=false
 if [ "${1:-}" = "--resume" ]; then
@@ -46,11 +47,12 @@ trap 'on_error $LINENO' ERR
 
 cleanup() {
   rm -rf "$TMP_DIR"
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$PROC_LOCK"
   termux-wake-unlock || true
 }
 trap cleanup EXIT
 
+echo "$$" > "$PROC_LOCK"
 termux-wake-lock
 
 if [ "$RESUME_MODE" = false ]; then
@@ -112,7 +114,8 @@ if [ ! -s "$TRANSCRIPT_FILE" ]; then
       -m "$WHISPER_MODEL" \
       -f "$SEG" \
       -l el \
-      -t 4 \
+      -t 3 \
+      -mc 0 \
       -otxt \
       -of "${SEG%.wav}" >/dev/null 2>&1
     sleep 10
@@ -128,8 +131,8 @@ termux-notification \
   --content "Επεξεργασία τμημάτων με Qwen2.5-1.5B..." \
   --ongoing
 
-# Σπάσιμο του transcript σε κομμάτια των 700 λέξεων (ασφαλές για -c 2048 και 3.5GB RAM)
-tr -s "[:space:]" "\n" < "$TRANSCRIPT_FILE" | split -l 700 -d - "$TMP_DIR/words_"
+# Σπάσιμο του transcript σε κομμάτια των 250 λέξεων (~1000-1250 tokens στα Ελληνικά, ασφαλές για -c 2048)
+tr -s "[:space:]" "\n" < "$TRANSCRIPT_FILE" | split -l 250 -d - "$TMP_DIR/words_"
 
 COMBINED_NOTES="$TMP_DIR/combined_notes.txt"
 : > "$COMBINED_NOTES"
@@ -154,8 +157,9 @@ EOP
     -m "$LLAMA_MODEL" \
     -f "$MAP_PROMPT" \
     -c 2048 \
+    -b 256 \
     -n 512 \
-    -t 4 \
+    -t 3 \
     --temp 0.1 \
     --repeat-penalty 1.15 \
     --no-display-prompt -no-cnv \
@@ -164,6 +168,42 @@ EOP
 
   CHUNK_IDX=$((CHUNK_IDX + 1))
   sleep 10
+done
+
+# --- Ιεραρχική συμπύκνωση αν οι σημειώσεις ξεπερνούν τις 450 λέξεις (~1800-2200 tokens στα Ελληνικά) ---
+REDUCE_ROUND=1
+while [ "$(wc -w < "$COMBINED_NOTES")" -gt 450 ]; do
+  NEXT_NOTES="$TMP_DIR/combined_round_${REDUCE_ROUND}.txt"
+  : > "$NEXT_NOTES"
+  rm -f "$TMP_DIR"/rwords_*
+  tr -s "[:space:]" "\n" < "$COMBINED_NOTES" | split -l 400 -d - "$TMP_DIR/rwords_"
+  for R_FILE in "$TMP_DIR"/rwords_*; do
+    [ -e "$R_FILE" ] || continue
+    R_TEXT=$(tr "\n" " " < "$R_FILE")
+    R_PROMPT="$TMP_DIR/r_prompt_${REDUCE_ROUND}_$(basename "$R_FILE").txt"
+    cat << EOP > "$R_PROMPT"
+<|im_start|>system
+Είσαι Business Analyst. Συγχώνευσε και συμπύκνωσε τις παρακάτω σημειώσεις στα Ελληνικά διατηρώντας όλα τα ουσιαστικά γεγονότα, απαιτήσεις και ερωτήματα σε σύντομα bullet points.<|im_end|>
+<|im_start|>user
+$R_TEXT<|im_end|>
+<|im_start|>assistant
+EOP
+    "$LLAMA_BIN" \
+      -m "$LLAMA_MODEL" \
+      -f "$R_PROMPT" \
+      -c 3072 \
+      -b 256 \
+      -n 300 \
+      -t 3 \
+      --temp 0.1 \
+      --repeat-penalty 1.15 \
+      --no-display-prompt -no-cnv \
+      -e >> "$NEXT_NOTES"
+    echo "" >> "$NEXT_NOTES"
+    sleep 10
+  done
+  mv "$NEXT_NOTES" "$COMBINED_NOTES"
+  REDUCE_ROUND=$((REDUCE_ROUND + 1))
 done
 
 # --- Τελική Σύνθεση (Reduce) ---
@@ -198,8 +238,9 @@ EOP
     -m "$LLAMA_MODEL" \
     -f "$REDUCE_PROMPT" \
     -c 3072 \
+    -b 256 \
     -n 1024 \
-    -t 4 \
+    -t 3 \
     --temp 0.2 \
     --repeat-penalty 1.15 \
     --no-display-prompt -no-cnv \

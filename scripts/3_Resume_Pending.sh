@@ -8,6 +8,11 @@ if [ -f "$HOME/.ba_recording.pid" ]; then
   exit 1
 fi
 
+if [ -f "$HOME/.ba_processing.pid" ] && kill -0 "$(cat "$HOME/.ba_processing.pid" 2>/dev/null)" 2>/dev/null; then
+  termux-toast "Εκτελείται ήδη επεξεργασία BA στο παρασκήνιο!"
+  exit 1
+fi
+
 PENDING_BASES=()
 shopt -s nullglob
 for f in "$WORK_DIR"/*.m4a "$WORK_DIR"/*.wav; do
